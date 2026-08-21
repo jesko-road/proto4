@@ -60,16 +60,21 @@ var (
 	encryptKeySet bool
 )
 
-// SetEncryptKey 配置全局 ChaCha20-Poly1305 key，进程内只应调用一次。
-// key 为 nil 表示显式关闭加密（使用加密位时会 panic）。
+// SetEncryptKey 配置全局 ChaCha20-Poly1305 key。
+// 重复调用会覆盖先前的 key。
 func SetEncryptKey(key *[KeyLen]byte) {
 	encryptKeyMu.Lock()
 	defer encryptKeyMu.Unlock()
-	if encryptKeySet {
-		panic("ENCRYPT_KEY_CHACHA20POLY1305 already configured")
-	}
 	encryptKey = key
 	encryptKeySet = true
+}
+
+// ResetEncryptKey 清除已配置的全局 key，仅供测试使用。
+func ResetEncryptKey() {
+	encryptKeyMu.Lock()
+	defer encryptKeyMu.Unlock()
+	encryptKey = nil
+	encryptKeySet = false
 }
 
 func requireEncryptKey() *[KeyLen]byte {
@@ -201,6 +206,15 @@ func decryptPayload(key *[KeyLen]byte, aad, payload []byte) ([]byte, error) {
 // WriteFrame 写入一帧。flags = 压缩 id，可与 ChaCha20Poly1305 OR。
 // 若设置了加密位，使用全局 key（未配置则 panic）。
 func WriteFrame(w io.Writer, messageType byte, txID uint64, data []byte, flags byte) error {
+	var key *[KeyLen]byte
+	if flags&ChaCha20Poly1305 != 0 {
+		key = requireEncryptKey()
+	}
+	return WriteFrameWithKey(w, messageType, txID, data, flags, key)
+}
+
+// WriteFrameWithKey 与 WriteFrame 相同，但加密时使用显式 key（供 SDK 使用，避免全局状态）。
+func WriteFrameWithKey(w io.Writer, messageType byte, txID uint64, data []byte, flags byte, key *[KeyLen]byte) error {
 	header, err := packHeaderByte(messageType, flags)
 	if err != nil {
 		return err
@@ -213,7 +227,9 @@ func WriteFrame(w io.Writer, messageType byte, txID uint64, data []byte, flags b
 		return err
 	}
 	if encrypted {
-		key := requireEncryptKey()
+		if key == nil {
+			return errors.New("encryption requires a 32-byte key")
+		}
 		aad := aeadAAD(header, txID)
 		payload, err = encryptPayload(key, aad, payload)
 		if err != nil {
@@ -251,6 +267,15 @@ func WriteFramePlain(w io.Writer, messageType byte, txID uint64, data []byte) er
 // ReadFrame 读取并解析一帧；自动解密/解压到 Frame.Data。
 // 若帧带加密位，使用全局 key（未配置则 panic）。
 func ReadFrame(r io.Reader) (*Frame, error) {
+	return readFrame(r, nil, true)
+}
+
+// ReadFrameWithKey 与 ReadFrame 相同，但解密时使用显式 key。
+func ReadFrameWithKey(r io.Reader, key *[KeyLen]byte) (*Frame, error) {
+	return readFrame(r, key, false)
+}
+
+func readFrame(r io.Reader, key *[KeyLen]byte, useGlobal bool) (*Frame, error) {
 	var headerBuf [1]byte
 	if _, err := io.ReadFull(r, headerBuf[:]); err != nil {
 		return nil, err
@@ -282,9 +307,15 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 
 	var err error
 	if encrypted {
-		key := requireEncryptKey()
+		k := key
+		if useGlobal {
+			k = requireEncryptKey()
+		}
+		if k == nil {
+			return nil, errors.New("encrypted frame requires a 32-byte key")
+		}
 		aad := aeadAAD(header, txID)
-		payload, err = decryptPayload(key, aad, payload)
+		payload, err = decryptPayload(k, aad, payload)
 		if err != nil {
 			return nil, err
 		}

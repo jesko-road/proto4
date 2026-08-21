@@ -138,6 +138,31 @@ impl<E: NodeExtra> Server<E> {
         self.run_and_notify(tx).await
     }
 
+    /// Start only the health-probe loop (for embedding into another TCP accept loop).
+    pub fn spawn_probe(&self) -> JoinHandle<()> {
+        let probe_inner = self.inner.clone();
+        let interval = self.probe_interval;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                if let Err(e) = run_probe_cycle(&probe_inner).await {
+                    eprintln!("dfinder probe cycle error: {e}");
+                }
+            }
+        })
+    }
+
+    /// Handle an already-read frame (for multiplexing with other protocols on one port).
+    pub async fn handle_frame(
+        &self,
+        stream: &mut TcpStream,
+        peer: SocketAddr,
+        frame: &Frame,
+    ) -> Result<(), ServerError> {
+        handle_frame(stream, peer, frame, &self.inner).await
+    }
+
     async fn run_and_notify(
         self,
         ready: tokio::sync::oneshot::Sender<SocketAddr>,
@@ -146,18 +171,8 @@ impl<E: NodeExtra> Server<E> {
         let addr = listener.local_addr()?;
         let _ = ready.send(addr);
         let inner = self.inner.clone();
-        let interval = self.probe_interval;
 
-        let probe_inner = inner.clone();
-        let probe_task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                if let Err(e) = run_probe_cycle(&probe_inner).await {
-                    eprintln!("dfinder probe cycle error: {e}");
-                }
-            }
-        });
+        let probe_task = self.spawn_probe();
 
         let result = async {
             loop {
@@ -218,18 +233,30 @@ async fn run_probe_cycle<E: NodeExtra>(
     Ok(())
 }
 
+/// Whether `message_type` belongs to the dfinder protocol.
+pub fn is_dfinder_message(message_type: u8) -> bool {
+    matches!(message_type, MSG_REGISTER | MSG_QUERY)
+}
+
 async fn handle_conn<E: NodeExtra>(
     mut stream: TcpStream,
     peer: SocketAddr,
     inner: Arc<RwLock<Inner<E>>>,
 ) -> Result<(), ServerError> {
     let frame = tiny_frame::read_frame(&mut stream).await?;
+    handle_frame(&mut stream, peer, &frame, &inner).await
+}
+
+async fn handle_frame<E: NodeExtra>(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    frame: &Frame,
+    inner: &Arc<RwLock<Inner<E>>>,
+) -> Result<(), ServerError> {
     match frame.message_type {
-        MSG_REGISTER => handle_register(&mut stream, peer, &frame, &inner).await,
-        MSG_QUERY => handle_query(&mut stream, &frame, &inner).await,
-        other => {
-            write_error(&mut stream, frame.tx_id, format!("unknown message_type {other}")).await
-        }
+        MSG_REGISTER => handle_register(stream, peer, frame, inner).await,
+        MSG_QUERY => handle_query(stream, frame, inner).await,
+        other => write_error(stream, frame.tx_id, format!("unknown message_type {other}")).await,
     }
 }
 

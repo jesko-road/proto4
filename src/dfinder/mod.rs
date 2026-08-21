@@ -3,13 +3,16 @@
 //! - 服务端：接受注册（peer IP 作为节点标识）、定时健康探测、过期注销；基本信息落 SQLite，健康状态在内存。
 //! - 客户端：向目标节点注册自己；按 label 查询后，再用本地健康检测函数二次过滤。
 
-mod protocol;
+pub mod protocol;
 mod store;
 
 pub mod client;
 pub mod server;
 
-pub use protocol::{NodeExtra, NodeInfo};
+pub use protocol::{
+    ErrorBody, MSG_ERROR, MSG_QUERY, MSG_QUERY_RESULT, MSG_REGISTER, MSG_REGISTER_ACK, NodeExtra,
+    NodeInfo, QueryRequest, QueryResult, RegisterRequest,
+};
 
 #[cfg(test)]
 mod tests {

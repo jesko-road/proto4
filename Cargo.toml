@@ -3,6 +3,14 @@ name = "proto4"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+strip = true
+
+[features]
+default = []
+# 开启后编译 prom_proxy（Prometheus remote_write 客户端 SDK + 代理服务端）
+prometheus = ["dep:prometheus", "dep:prost", "dep:reqwest", "dep:snap"]
+
 [dependencies]
 chacha20poly1305 = "0.10"
 flate2 = "1"
@@ -14,5 +22,17 @@ serde_json = "1.0.150"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
+# prometheus feature
+prometheus = { version = "0.13", default-features = false, optional = true }
+prost = { version = "0.13", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+snap = { version = "1", optional = true }
+
+[[bin]]
+name = "prom_proxy"
+path = "src/bin/prom_proxy.rs"
+required-features = ["prometheus"]
+
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
+wiremock = "0.6"
