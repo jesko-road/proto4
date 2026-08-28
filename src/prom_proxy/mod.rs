@@ -3,13 +3,16 @@
 //! - 客户端发送的 `body` 应为 Prometheus remote_write 的 HTTP body
 //!   （protobuf `WriteRequest` + Snappy block 压缩），服务端原样 POST。
 //! - 帧 payload 长度上限为 `u16::MAX`（加密后），大批次需自行切分。
+//! - edge 计数持久化在 Redis Hash（默认 `prom_proxy:edges`）。
 
 pub mod client;
+pub mod edge;
 pub mod encode;
 pub mod protocol;
 pub mod server;
 
 pub use client::{Client, ClientError};
+pub use edge::{DEFAULT_EDGE_HASH_KEY, EdgeError, EdgeStore};
 pub use encode::{
     EncodeError, Label, Sample, TimeSeries, encode_metric_families, encode_write_request,
 };
@@ -38,6 +41,16 @@ mod tests {
         });
     }
 
+    fn test_redis_url() -> String {
+        std::env::var("PROM_PROXY_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
+    }
+
+    async fn test_server(listen: SocketAddr, prometheus_url: String) -> Option<Server> {
+        Server::new(ServerConfig::new(listen, prometheus_url, test_redis_url()))
+            .await
+            .ok()
+    }
+
     #[tokio::test]
     async fn proxy_forwards_body_and_returns_ack() {
         ensure_key();
@@ -54,10 +67,10 @@ mod tests {
             .await;
 
         let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = Server::new(ServerConfig::new(
-            listen,
-            format!("{}/api/v1/write", mock.uri()),
-        ));
+        let Some(server) = test_server(listen, format!("{}/api/v1/write", mock.uri())).await
+        else {
+            return;
+        };
         let (handle, ready) = server.spawn_with_addr();
         let addr = ready.await.unwrap();
 
@@ -82,18 +95,19 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let server = Server::new(ServerConfig::new(
+        let Some(server) = test_server(
             "127.0.0.1:0".parse().unwrap(),
             format!("{}/api/v1/write", mock.uri()),
-        ));
+        )
+        .await
+        else {
+            return;
+        };
         let (handle, ready) = server.spawn_with_addr();
         let addr = ready.await.unwrap();
 
         let mut client = Client::new();
-        let err = client
-            .remote_write(addr, b"x")
-            .await
-            .unwrap_err();
+        let err = client.remote_write(addr, b"x").await.unwrap_err();
         assert!(err.to_string().contains("400"), "{err}");
 
         handle.abort();

@@ -9,7 +9,7 @@ strip = true
 [features]
 default = []
 # 开启后编译 prom_proxy（Prometheus remote_write 客户端 SDK + 代理服务端）
-prometheus = ["dep:prometheus", "dep:prost", "dep:reqwest", "dep:snap"]
+prometheus = ["dep:prometheus", "dep:prost", "dep:reqwest", "dep:snap", "dep:redis"]
 
 [dependencies]
 chacha20poly1305 = "0.10"
@@ -27,6 +27,7 @@ prometheus = { version = "0.13", default-features = false, optional = true }
 prost = { version = "0.13", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 snap = { version = "1", optional = true }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
 
 [[bin]]
 name = "prom_proxy"
