@@ -192,15 +192,12 @@ fn decrypt_payload(key: &[u8; KEY_LEN], aad: &[u8], payload: &[u8]) -> io::Resul
         })
 }
 
-/// 写入一帧。`flags` = 压缩 id，可与 `CHACHA20POLY1305` OR。
-/// 若设置了加密位，使用全局 `ENCRYPT_KEY_CHACHA20POLY1305`（未配置则 panic）。
-pub async fn write_frame<T: AsyncWrite + Unpin + Send>(
-    w: &mut T,
+fn build_wire_frame(
     message_type: u8,
     tx_id: u64,
     data: &[u8],
     flags: u8,
-) -> io::Result<()> {
+) -> io::Result<Vec<u8>> {
     let header = pack_header_byte(message_type, flags)?;
     let compress_id = flags & COMPRESS_MASK;
     let encrypted = flags & CHACHA20POLY1305 != 0;
@@ -224,46 +221,16 @@ pub async fn write_frame<T: AsyncWrite + Unpin + Send>(
     buf.extend_from_slice(&tx_id.to_be_bytes());
     buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     buf.extend_from_slice(&payload);
-
-    w.write_all(&buf).await?;
-    w.flush().await?;
-    Ok(())
+    Ok(buf)
 }
 
-/// 明文、无压缩写入
-pub async fn write_frame_plain<T: AsyncWrite + Unpin + Send>(
-    w: &mut T,
-    message_type: u8,
-    tx_id: u64,
-    data: &[u8],
-) -> io::Result<()> {
-    write_frame(w, message_type, tx_id, data, COMPRESS_NONE).await
-}
-
-/// 读取并解析一帧；自动解密/解压到 `Frame::data`。
-/// 若帧带加密位，使用全局 `ENCRYPT_KEY_CHACHA20POLY1305`（未配置则 panic）。
-pub async fn read_frame<T: AsyncRead + Unpin + Send>(r: &mut T) -> io::Result<Frame> {
-    let mut header_buf = [0u8; 1];
-    r.read_exact(&mut header_buf).await?;
-    let header = header_buf[0];
+fn parse_wire_frame(header: u8, tx_id: u64, payload: Vec<u8>) -> io::Result<Frame> {
     let message_type = header >> 3;
     let flags = header & FLAGS_MASK;
     let compress_id = flags & COMPRESS_MASK;
     let encrypted = flags & CHACHA20POLY1305 != 0;
 
-    let mut tx_bytes = [0u8; 8];
-    r.read_exact(&mut tx_bytes).await?;
-    let tx_id = u64::from_be_bytes(tx_bytes);
-
-    let mut len_bytes = [0u8; 2];
-    r.read_exact(&mut len_bytes).await?;
-    let len = u16::from_be_bytes(len_bytes) as usize;
-
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        r.read_exact(&mut payload).await?;
-    }
-
+    let mut payload = payload;
     if encrypted {
         let key = require_encrypt_key();
         let aad = aead_aad(header, tx_id);
@@ -278,6 +245,94 @@ pub async fn read_frame<T: AsyncRead + Unpin + Send>(r: &mut T) -> io::Result<Fr
         tx_id,
         data,
     })
+}
+
+/// 写入一帧。`flags` = 压缩 id，可与 `CHACHA20POLY1305` OR。
+/// 若设置了加密位，使用全局 `ENCRYPT_KEY_CHACHA20POLY1305`（未配置则 panic）。
+pub async fn write_frame<T: AsyncWrite + Unpin + Send>(
+    w: &mut T,
+    message_type: u8,
+    tx_id: u64,
+    data: &[u8],
+    flags: u8,
+) -> io::Result<()> {
+    let buf = build_wire_frame(message_type, tx_id, data, flags)?;
+    w.write_all(&buf).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// 同步写入一帧（`std::io::Write`），语义同 [`write_frame`]。
+pub fn write_frame_blocking<W: Write>(
+    w: &mut W,
+    message_type: u8,
+    tx_id: u64,
+    data: &[u8],
+    flags: u8,
+) -> io::Result<()> {
+    let buf = build_wire_frame(message_type, tx_id, data, flags)?;
+    w.write_all(&buf)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// 明文、无压缩写入
+pub async fn write_frame_plain<T: AsyncWrite + Unpin + Send>(
+    w: &mut T,
+    message_type: u8,
+    tx_id: u64,
+    data: &[u8],
+) -> io::Result<()> {
+    write_frame(w, message_type, tx_id, data, COMPRESS_NONE).await
+}
+
+fn read_frame_header<R: Read>(r: &mut R) -> io::Result<(u8, u64, Vec<u8>)> {
+    let mut header_buf = [0u8; 1];
+    r.read_exact(&mut header_buf)?;
+    let header = header_buf[0];
+
+    let mut tx_bytes = [0u8; 8];
+    r.read_exact(&mut tx_bytes)?;
+    let tx_id = u64::from_be_bytes(tx_bytes);
+
+    let mut len_bytes = [0u8; 2];
+    r.read_exact(&mut len_bytes)?;
+    let len = u16::from_be_bytes(len_bytes) as usize;
+
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        r.read_exact(&mut payload)?;
+    }
+    Ok((header, tx_id, payload))
+}
+
+/// 读取并解析一帧；自动解密/解压到 `Frame::data`。
+/// 若帧带加密位，使用全局 `ENCRYPT_KEY_CHACHA20POLY1305`（未配置则 panic）。
+pub async fn read_frame<T: AsyncRead + Unpin + Send>(r: &mut T) -> io::Result<Frame> {
+    let mut header_buf = [0u8; 1];
+    r.read_exact(&mut header_buf).await?;
+    let header = header_buf[0];
+
+    let mut tx_bytes = [0u8; 8];
+    r.read_exact(&mut tx_bytes).await?;
+    let tx_id = u64::from_be_bytes(tx_bytes);
+
+    let mut len_bytes = [0u8; 2];
+    r.read_exact(&mut len_bytes).await?;
+    let len = u16::from_be_bytes(len_bytes) as usize;
+
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        r.read_exact(&mut payload).await?;
+    }
+
+    parse_wire_frame(header, tx_id, payload)
+}
+
+/// 同步读取一帧（`std::io::Read`），语义同 [`read_frame`]。
+pub fn read_frame_blocking<R: Read>(r: &mut R) -> io::Result<Frame> {
+    let (header, tx_id, payload) = read_frame_header(r)?;
+    parse_wire_frame(header, tx_id, payload)
 }
 
 #[cfg(test)]
@@ -378,5 +433,29 @@ mod tests {
 
         let err = read_frame(&mut raw.as_slice()).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn blocking_roundtrip(message_type: u8, tx_id: u64, data: &[u8], flags: u8) {
+        if flags & CHACHA20POLY1305 != 0 {
+            ensure_test_key();
+        }
+        let mut buf = Vec::new();
+        write_frame_blocking(&mut buf, message_type, tx_id, data, flags).unwrap();
+        let frame = read_frame_blocking(&mut buf.as_slice()).unwrap();
+        assert_eq!(frame.message_type, message_type);
+        assert_eq!(frame.compress_id, flags & COMPRESS_MASK);
+        assert_eq!(frame.encrypted, flags & CHACHA20POLY1305 != 0);
+        assert_eq!(frame.tx_id, tx_id);
+        assert_eq!(frame.data, data);
+    }
+
+    #[test]
+    fn blocking_plain_roundtrip() {
+        blocking_roundtrip(0x15, 0x1122334455667788, b"hello frame", COMPRESS_NONE);
+    }
+
+    #[test]
+    fn blocking_encrypt_roundtrip() {
+        blocking_roundtrip(3, 99, b"secret payload", CHACHA20POLY1305);
     }
 }

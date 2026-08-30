@@ -26,6 +26,7 @@ pub use server::{Server, ServerConfig, ServerError};
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Once;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -34,6 +35,7 @@ mod tests {
     use crate::tiny_frame::{self, KEY_LEN};
 
     static INIT_KEY: Once = Once::new();
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn ensure_key() {
         INIT_KEY.call_once(|| {
@@ -46,9 +48,18 @@ mod tests {
     }
 
     async fn test_server(listen: SocketAddr, prometheus_url: String) -> Option<Server> {
-        Server::new(ServerConfig::new(listen, prometheus_url, test_redis_url()))
-            .await
-            .ok()
+        let redis_url = test_redis_url();
+        let hash_key = format!(
+            "prom_proxy:test:mod:{}",
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let edges = EdgeStore::connect(&redis_url, &hash_key).await.ok()?;
+        edges.clear().await.ok();
+        Server::new(
+            ServerConfig::new(listen, prometheus_url, redis_url).edge_hash_key(hash_key),
+        )
+        .await
+        .ok()
     }
 
     #[tokio::test]
@@ -79,6 +90,39 @@ mod tests {
 
         let mut client = Client::new();
         let status = client.remote_write(addr, &body).await.unwrap();
+        assert_eq!(status, 204);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn blocking_client_forwards_body_and_returns_ack() {
+        ensure_key();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/write"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let Some(server) = test_server(listen, format!("{}/api/v1/write", mock.uri())).await
+        else {
+            return;
+        };
+        let (handle, ready) = server.spawn_with_addr();
+        let addr = ready.await.unwrap();
+
+        let body = prepare_remote_write_body(b"fake-write-request-protobuf");
+        let status = tokio::task::spawn_blocking(move || {
+            let mut client = Client::new();
+            client.remote_write_blocking(addr, &body)
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(status, 204);
 
         handle.abort();
