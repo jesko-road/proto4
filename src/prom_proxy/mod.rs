@@ -12,7 +12,7 @@ pub mod protocol;
 pub mod server;
 
 pub use client::{Client, ClientError};
-pub use edge::{DEFAULT_EDGE_HASH_KEY, EdgeError, EdgeStore};
+pub use edge::{DEFAULT_EDGE_HASH_KEY, EdgeError, EdgeStore, EdgeStoreBlocking};
 pub use encode::{
     EncodeError, Label, Sample, TimeSeries, encode_metric_families, encode_write_request,
 };
